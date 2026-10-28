@@ -1,3 +1,4 @@
+
 <!doctype html>
 <html lang="en">
 <head>
@@ -34,11 +35,7 @@ canvas{width:100%;height:230px;display:block}
 table{width:100%;border-collapse:collapse;font-size:.85rem}
 th,td{text-align:left;padding:9px 5px;border-bottom:1px solid var(--line);vertical-align:top}
 th{color:var(--muted);font-weight:600}
-@media(max-width:650px){
- main{padding:12px}
- .span8,.span6,.span4{grid-column:span 12}
- .price{font-size:1.55rem}
-}
+@media(max-width:650px){main{padding:12px}.span8,.span6,.span4{grid-column:span 12}.price{font-size:1.55rem}}
 </style>
 </head>
 <body>
@@ -75,7 +72,7 @@ th{color:var(--muted);font-weight:600}
   </div>
  </div>
  <div class="notice" style="margin-top:10px">
-  Uses public Deriv market data. No trading login, API key or account permission is needed for this signal-only dashboard. The App ID input has been removed because it is not needed for the public endpoint used here.
+  Uses Deriv's public market-data endpoint. No App ID, API token or trading login is required for this public-data connection. This dashboard does not place trades.
  </div>
  <button id="start">Connect market data</button>
  <div id="status" class="status muted" role="status" aria-live="polite">Not connected. Press Connect market data.</div>
@@ -124,7 +121,7 @@ th{color:var(--muted);font-weight:600}
 <section class="card span12">
  <label>Recent candles — close-price view</label>
  <canvas id="chart" width="900" height="230" aria-label="EUR/USD closing prices"></canvas>
- <div class="notice">The live tick and completed candle close are shown separately. Prices may differ from another broker's quotes. Signals are based on completed candles only.</div>
+ <div class="notice">Live tick and completed candle close are shown separately. Prices may differ from another broker's quotes. Signals use completed candles only.</div>
 </section>
 
 <section class="card span12">
@@ -144,26 +141,25 @@ th{color:var(--muted);font-weight:600}
   <div class="metric"><span class="muted">Wins / losses</span><b id="btWL">—</b></div>
   <div class="metric"><span class="muted">Win rate</span><b id="btRate">—</b></div>
  </div>
- <div class="notice" id="btNote">Backtest is an educational historical estimate, not a prediction of future results.</div>
+ <div class="notice" id="btNote">Historical estimate only, not a prediction.</div>
 </section>
 
 <section class="card span12">
  <div class="notice">
   <b>Additional filters status</b><br>
-  • EMA 9/21, RSI 14, MACD 12/26/9 and ATR 14 are calculated from historical candles.<br>
+  • EMA 9/21, RSI 14, MACD 12/26/9 and ATR 14 are calculated from candles.<br>
   • Economic news and DXY confirmation are not connected.<br>
-  • HIGH-QUALITY means rule confluence only; it is not a probability of winning.
+  • HIGH-QUALITY means rule confluence, not probability of winning.
  </div>
 </section>
 
 <section class="card span12">
  <div class="notice">
   <b>Important limitations</b><br>
-  • This dashboard only displays signals. It does not place trades or move funds.<br>
+  • Signal-only dashboard. It does not place trades or move funds.<br>
   • BUY/SELL signals do not guarantee profit.<br>
-  • The backtest does not include spread, payout rules, slippage or execution delays.<br>
-  • The public WebSocket connection can fail because of network, service, symbol or API issues. The dashboard displays the close code and error when available.<br>
-  • Do not treat the signal quality score as a win probability.
+  • Backtest excludes spread, payout rules, slippage and execution delays.<br>
+  • Code 1006 means the connection closed abnormally; it does not identify the cause by itself.
  </div>
 </section>
 </div>
@@ -173,9 +169,11 @@ th{color:var(--muted);font-weight:600}
 'use strict';
 
 const $ = id => document.getElementById(id);
-
 const SYMBOL = 'frxEURUSD';
-const WS_URL = 'wss://ws.binaryws.com/websockets/v3';
+
+/* Official public market-data WebSocket endpoint; no App ID required. */
+const WS_URL = 'wss://api.derivws.com/trading/v1/options/ws/public';
+
 const POLL_MS = 30000;
 const CANDLE_COUNT = 200;
 
@@ -183,584 +181,363 @@ let candles = [];
 let ws = null;
 let busy = false;
 let lastFetch = 0;
-let reconnectTimer = null;
 let pollTimer = null;
 let historyRows = [];
 let lastLogged = '';
-let liveTick = NaN;
 let requestCounter = 100;
 let activeHistoryReq = null;
 let connectionGeneration = 0;
-let manuallyDisconnected = false;
+let tickSubscriptionId = null;
 
 const TIMEFRAME_SECONDS = {
- '1min':60,
- '5min':300,
- '15min':900,
- '30min':1800,
- '1h':3600
+ '1min':60,'5min':300,'15min':900,'30min':1800,'1h':3600
 };
-
 const TIMEFRAME_MS = {
- '1min':60000,
- '5min':300000,
- '15min':900000,
- '30min':1800000,
- '1h':3600000
+ '1min':60000,'5min':300000,'15min':900000,'30min':1800000,'1h':3600000
 };
 
-function fmt(n, digits=5) {
- return Number.isFinite(Number(n)) ? Number(n).toFixed(digits) : '—';
+function fmt(n,d=5) {
+ return Number.isFinite(Number(n)) ? Number(n).toFixed(d) : '—';
 }
-
-function sriLankaTime(epoch, includeDate=true) {
- if (!Number.isFinite(Number(epoch))) return 'time unavailable';
- return new Date(Number(epoch)*1000).toLocaleString('en-GB', {
-  timeZone:'Asia/Colombo',
-  hour12:false,
-  ...(includeDate ? {} : {year:undefined,month:undefined,day:undefined})
+function sriLankaTime(epoch) {
+ if(!Number.isFinite(Number(epoch))) return 'time unavailable';
+ return new Date(Number(epoch)*1000).toLocaleString('en-GB',{
+  timeZone:'Asia/Colombo',hour12:false
  });
 }
-
-function setStatus(message) {
- $('status').textContent = message;
+function setStatus(message){$('status').textContent=message}
+function showError(message){setStatus('Deriv connection error: '+message)}
+function setConnectButton(disabled,label){
+ $('start').disabled=disabled;
+ $('start').textContent=label;
 }
-
-function showError(message) {
- setStatus('Deriv connection error: ' + message);
-}
-
-function setConnectButton(disabled, label) {
- $('start').disabled = disabled;
- $('start').textContent = label;
-}
-
-function sendRequest(payload) {
- if (!ws || ws.readyState !== WebSocket.OPEN) {
-  throw new Error('WebSocket is not open');
- }
+function sendRequest(payload){
+ if(!ws||ws.readyState!==WebSocket.OPEN) throw Error('WebSocket is not open');
  ws.send(JSON.stringify(payload));
 }
 
-function ema(values, period) {
- if (!values.length) return [];
- const k = 2/(period+1);
- const out = [];
- let prev = values[0];
- out.push(prev);
- for (let i=1;i<values.length;i++) {
-  prev = values[i]*k + prev*(1-k);
-  out.push(prev);
+function ema(values,period){
+ if(!values.length)return [];
+ const k=2/(period+1),out=[];
+ let prev=values[0];out.push(prev);
+ for(let i=1;i<values.length;i++){
+  prev=values[i]*k+prev*(1-k);out.push(prev);
  }
  return out;
 }
 
-function rsiSeries(values, period=14) {
- const out = Array(values.length).fill(null);
- if (values.length <= period) return out;
-
- let gain=0, loss=0;
- for (let i=1;i<=period;i++) {
+function rsiSeries(values,period=14){
+ const out=Array(values.length).fill(null);
+ if(values.length<=period)return out;
+ let gain=0,loss=0;
+ for(let i=1;i<=period;i++){
   const change=values[i]-values[i-1];
-  if (change>0) gain+=change;
-  else loss-=change;
+  if(change>0)gain+=change;else loss-=change;
  }
-
- let avgGain=gain/period;
- let avgLoss=loss/period;
-
- function calcRSI(g,l) {
-  if (g===0 && l===0) return 50;
-  if (l===0) return 100;
-  if (g===0) return 0;
-  return 100-(100/(1+g/l));
- }
-
- out[period]=calcRSI(avgGain,avgLoss);
-
- for (let i=period+1;i<values.length;i++) {
+ let avgGain=gain/period,avgLoss=loss/period;
+ const calc=(g,l)=>g===0&&l===0?50:l===0?100:g===0?0:100-100/(1+g/l);
+ out[period]=calc(avgGain,avgLoss);
+ for(let i=period+1;i<values.length;i++){
   const change=values[i]-values[i-1];
-  const g=Math.max(change,0);
-  const l=Math.max(-change,0);
-  avgGain=(avgGain*(period-1)+g)/period;
-  avgLoss=(avgLoss*(period-1)+l)/period;
-  out[i]=calcRSI(avgGain,avgLoss);
+  avgGain=(avgGain*(period-1)+Math.max(change,0))/period;
+  avgLoss=(avgLoss*(period-1)+Math.max(-change,0))/period;
+  out[i]=calc(avgGain,avgLoss);
  }
  return out;
 }
 
-function atrSeries(data, period=14) {
+function atrSeries(data,period=14){
  const tr=[];
- for (let i=0;i<data.length;i++) {
-  const high=Number(data[i].high);
-  const low=Number(data[i].low);
-  const prev=i ? Number(data[i-1].close) : NaN;
-  if (![high,low].every(Number.isFinite)) {
-   tr.push(NaN);
-   continue;
-  }
-  tr.push(i && Number.isFinite(prev)
-   ? Math.max(high-low,Math.abs(high-prev),Math.abs(low-prev))
-   : high-low);
+ for(let i=0;i<data.length;i++){
+  const high=Number(data[i].high),low=Number(data[i].low);
+  const prev=i?Number(data[i-1].close):NaN;
+  tr.push(!Number.isFinite(high)||!Number.isFinite(low)?NaN:
+   i&&Number.isFinite(prev)
+   ?Math.max(high-low,Math.abs(high-prev),Math.abs(low-prev))
+   :high-low);
  }
  const out=Array(data.length).fill(null);
- if (data.length<period || tr.slice(0,period).some(v=>!Number.isFinite(v))) return out;
+ if(data.length<period||tr.slice(0,period).some(v=>!Number.isFinite(v)))return out;
  let value=tr.slice(0,period).reduce((a,b)=>a+b,0)/period;
  out[period-1]=value;
- for (let i=period;i<tr.length;i++) {
-  if (!Number.isFinite(tr[i])) continue;
-  value=((value*(period-1))+tr[i])/period;
+ for(let i=period;i<tr.length;i++){
+  if(!Number.isFinite(tr[i]))continue;
+  value=(value*(period-1)+tr[i])/period;
   out[i]=value;
  }
  return out;
 }
 
-function indicatorState(data) {
- const c=data.map(x=>Number(x.close));
- if (c.length<50 || c.some(v=>!Number.isFinite(v))) return null;
-
- const e9=ema(c,9);
- const e21=ema(c,21);
- const fast=ema(c,12);
- const slow=ema(c,26);
+function indicatorState(data){
+ const closes=data.map(c=>Number(c.close));
+ if(closes.length<50||closes.some(v=>!Number.isFinite(v)))return null;
+ const e9=ema(closes,9),e21=ema(closes,21);
+ const fast=ema(closes,12),slow=ema(closes,26);
  const macdLine=fast.map((v,i)=>v-slow[i]);
  const signalLine=ema(macdLine,9);
  const histogram=macdLine.map((v,i)=>v-signalLine[i]);
- const rsi=rsiSeries(c,14);
- const atr=atrSeries(data,14);
- const i=c.length-1;
-
- if (![e9[i],e21[i],rsi[i],macdLine[i],histogram[i],atr[i]].every(Number.isFinite)) return null;
-
- return {
-  e9:e9[i], e21:e21[i], r:rsi[i],
-  m:macdLine[i], h:histogram[i],
-  atr:atr[i], close:c[i], index:i
- };
+ const rsi=rsiSeries(closes,14),atr=atrSeries(data,14);
+ const i=closes.length-1;
+ if(![e9[i],e21[i],rsi[i],macdLine[i],histogram[i],atr[i]].every(Number.isFinite))return null;
+ return {e9:e9[i],e21:e21[i],r:rsi[i],m:macdLine[i],h:histogram[i],atr:atr[i]};
 }
 
-function sessionInfo(epoch) {
+function sessionInfo(epoch){
  const date=new Date(epoch*1000);
- const h=date.getUTCHours()+date.getUTCMinutes()/60;
- const london=h>=7 && h<16;
- const newYork=h>=12 && h<21;
-
- if (london && newYork) return {name:'Overlap',active:true};
- if (london) return {name:'London',active:true};
- if (newYork) return {name:'New York',active:true};
+ const hour=date.getUTCHours()+date.getUTCMinutes()/60;
+ const london=hour>=7&&hour<16;
+ const newYork=hour>=12&&hour<21;
+ if(london&&newYork)return {name:'Overlap',active:true};
+ if(london)return {name:'London',active:true};
+ if(newYork)return {name:'New York',active:true};
  return {name:'Quiet hours',active:false};
 }
 
-function qualityFor(s, session, atrMean) {
- if (!s) return {score:0,label:'Need more candles'};
- let score=0;
- const bullish=s.e9>s.e21;
- const bearish=s.e9<s.e21;
-
- if ((bullish&&s.r>50&&s.h>0)||(bearish&&s.r<50&&s.h<0)) score+=60;
- if ((bullish&&s.r>=55)||(bearish&&s.r<=45)) score+=10;
- if ((bullish&&s.h>0)||(bearish&&s.h<0)) score+=10;
- if (session.active) score+=10;
- if (atrMean && s.atr>=atrMean*.6) score+=10;
-
- score=Math.min(100,score);
- return {
-  score,
-  label:score>=80?'HIGH-QUALITY confluence':
-   score>=60?'Moderate confluence':'Weak / incomplete confluence'
- };
-}
-
-function calcSignal(data) {
+function calcSignal(data){
  const s=indicatorState(data);
- if (!s) {
-  return {
-   signal:'WAIT',reason:'Need at least 50 valid candles',
-   e9:null,e21:null,r:null,m:null,h:null,
-   atr:null,score:0,quality:'Need more candles'
-  };
- }
-
+ if(!s)return {signal:'WAIT',reason:'Need at least 50 valid candles',
+  e9:null,e21:null,r:null,h:null,atr:null,score:0,quality:'Need more candles'};
  const last=data[data.length-1];
  const session=sessionInfo(last.epoch);
- const atrValues=atrSeries(data,14).filter(Number.isFinite);
- const recentATR=atrValues.slice(-30);
- const atrMean=recentATR.length
-  ? recentATR.reduce((a,b)=>a+b,0)/recentATR.length
-  : null;
-
- const q=qualityFor(s,session,atrMean);
- const bullish=s.e9>s.e21 && s.r>50 && s.h>0;
- const bearish=s.e9<s.e21 && s.r<50 && s.h<0;
- const rawSignal=bullish?'BUY':bearish?'SELL':'WAIT';
- const approved=rawSignal!=='WAIT' && q.score>=80;
- const signal=approved?rawSignal:'WAIT';
-
- let reason;
- if (approved && signal==='BUY') {
-  reason='HIGH-QUALITY: EMA bullish + RSI > 50 + MACD histogram positive';
- } else if (approved && signal==='SELL') {
-  reason='HIGH-QUALITY: EMA bearish + RSI < 50 + MACD histogram negative';
- } else if (rawSignal==='WAIT') {
-  reason='Indicators are not fully aligned';
- } else {
-  reason=q.label+'; quality filter did not pass';
- }
-
- return {
-  signal,rawSignal,reason,
-  e9:s.e9,e21:s.e21,r:s.r,m:s.m,h:s.h,
-  atr:s.atr,score:q.score,quality:q.label,
-  session:session.name,sessionActive:session.active,atrMean
- };
+ const atrValues=atrSeries(data,14).filter(Number.isFinite).slice(-30);
+ const atrMean=atrValues.length?atrValues.reduce((a,b)=>a+b,0)/atrValues.length:null;
+ let score=0;
+ const bullish=s.e9>s.e21,bearish=s.e9<s.e21;
+ if((bullish&&s.r>50&&s.h>0)||(bearish&&s.r<50&&s.h<0))score+=60;
+ if((bullish&&s.r>=55)||(bearish&&s.r<=45))score+=10;
+ if((bullish&&s.h>0)||(bearish&&s.h<0))score+=10;
+ if(session.active)score+=10;
+ if(atrMean&&s.atr>=atrMean*.6)score+=10;
+ score=Math.min(100,score);
+ const quality=score>=80?'HIGH-QUALITY confluence':
+  score>=60?'Moderate confluence':'Weak / incomplete confluence';
+ const raw=bullish&&s.r>50&&s.h>0?'BUY':
+  bearish&&s.r<50&&s.h<0?'SELL':'WAIT';
+ const signal=raw!=='WAIT'&&score>=80?raw:'WAIT';
+ const reason=signal==='BUY'
+  ?'HIGH-QUALITY: EMA bullish + RSI > 50 + MACD histogram positive'
+  :signal==='SELL'
+  ?'HIGH-QUALITY: EMA bearish + RSI < 50 + MACD histogram negative'
+  :raw==='WAIT'?'Indicators are not fully aligned':quality+'; quality filter did not pass';
+ return {signal,rawSignal:raw,reason,e9:s.e9,e21:s.e21,r:s.r,m:s.m,h:s.h,
+  atr:s.atr,score,quality,session:session.name,sessionActive:session.active,atrMean};
 }
 
-function drawChart(data) {
- const cv=$('chart');
- const ctx=cv.getContext('2d');
- const w=cv.width,h=cv.height;
- ctx.clearRect(0,0,w,h);
- ctx.strokeStyle='#25334a';
- ctx.fillStyle='#9aabc2';
- ctx.font='12px system-ui';
-
- for (let j=0;j<5;j++) {
+function drawChart(data){
+ const cv=$('chart'),ctx=cv.getContext('2d'),w=cv.width,h=cv.height;
+ ctx.clearRect(0,0,w,h);ctx.strokeStyle='#25334a';ctx.fillStyle='#9aabc2';ctx.font='12px system-ui';
+ for(let j=0;j<5;j++){
   const y=12+j*(h-28)/4;
   ctx.beginPath();ctx.moveTo(45,y);ctx.lineTo(w-8,y);ctx.stroke();
  }
-
- if (!data.length) return;
-
- const values=data.map(x=>Number(x.close)).filter(Number.isFinite);
- if (!values.length) return;
-
+ if(!data.length)return;
+ const values=data.map(c=>Number(c.close)).filter(Number.isFinite);
+ if(!values.length)return;
  let lo=Math.min(...values),hi=Math.max(...values);
- if (hi===lo) {hi+=0.0001;lo-=0.0001;}
-
- ctx.fillText(hi.toFixed(5),2,16);
- ctx.fillText(lo.toFixed(5),2,h-7);
- ctx.strokeStyle='#20c997';
- ctx.lineWidth=2;
- ctx.beginPath();
-
+ if(hi===lo){hi+=.0001;lo-=.0001}
+ ctx.fillText(hi.toFixed(5),2,16);ctx.fillText(lo.toFixed(5),2,h-7);
+ ctx.strokeStyle='#20c997';ctx.lineWidth=2;ctx.beginPath();
  values.forEach((v,i)=>{
   const x=45+i*(w-60)/Math.max(1,values.length-1);
   const y=12+(hi-v)*(h-28)/(hi-lo);
-  if (i===0) ctx.moveTo(x,y);
-  else ctx.lineTo(x,y);
+  if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);
  });
  ctx.stroke();
 }
 
-function render() {
- if (!candles.length) return;
+function backtest(data){
+ let wins=0,losses=0,trades=0;
+ const expiry=Number($('expiry').value)||1;
+ const mins={'1min':1,'5min':5,'15min':15,'30min':30,'1h':60}[$('timeframe').value]||1;
+ const bars=Math.max(1,Math.ceil(expiry/mins));
+ for(let i=50;i<data.length-bars;i++){
+  const state=calcSignal(data.slice(0,i+1));
+  if(state.signal!=='BUY'&&state.signal!=='SELL')continue;
+  const entry=Number(data[i].close),exit=Number(data[i+bars].close);
+  if(!Number.isFinite(entry)||!Number.isFinite(exit)||entry===exit)continue;
+  trades++;
+  if((state.signal==='BUY'&&exit>entry)||(state.signal==='SELL'&&exit<entry))wins++;
+  else losses++;
+ }
+ $('btTrades').textContent=String(trades);
+ $('btWL').textContent=wins+' / '+losses;
+ $('btRate').textContent=trades?(100*wins/trades).toFixed(1)+'%':'—';
+ $('btNote').textContent='Historical close-to-close estimate using '+bars+
+  ' candle(s) as the expiry approximation. Excludes spread, slippage, payout rules and execution delays.';
+}
 
+function render(){
+ if(!candles.length)return;
  const last=candles[candles.length-1];
  const tfMs=TIMEFRAME_MS[$('timeframe').value]||60000;
- const latestIsClosed=Date.now() >= (last.epoch*1000+tfMs);
-
- // Only use fully completed candles for indicator calculations.
- const signalCandles=latestIsClosed ? candles : candles.slice(0,-1);
+ const latestIsClosed=Date.now()>=(last.epoch*1000+tfMs);
+ const signalCandles=latestIsClosed?candles:candles.slice(0,-1);
  const c=calcSignal(signalCandles);
-
  $('price').textContent=fmt(last.close);
- $('candleTime').textContent=
-  'Candle start: '+sriLankaTime(last.epoch)+' Sri Lanka · '+
-  (latestIsClosed?'latest candle closed':'latest candle forming; excluded from signal');
-
+ $('candleTime').textContent='Candle start: '+sriLankaTime(last.epoch)+
+  ' Sri Lanka · '+(latestIsClosed?'latest candle closed':'forming candle; excluded from signal');
  $('signal').textContent=c.signal;
  $('signal').className='signal '+(c.signal==='BUY'?'buy':c.signal==='SELL'?'sell':'wait');
  $('signalReason').textContent=c.reason;
- $('ema').textContent=c.e9===null?'—':(c.e9>c.e21?'Bullish':c.e9<c.e21?'Bearish':'Neutral');
+ $('ema').textContent=c.e9===null?'—':c.e9>c.e21?'Bullish':c.e9<c.e21?'Bearish':'Neutral';
  $('rsi').textContent=c.r===null?'—':c.r.toFixed(1);
- $('macd').textContent=c.h===null?'—':(c.h>0?'Positive':c.h<0?'Negative':'Zero');
+ $('macd').textContent=c.h===null?'—':c.h>0?'Positive':c.h<0?'Negative':'Zero';
  $('quality').textContent=c.score+'/100';
  $('qualityText').textContent=c.quality+' (not a win probability)';
  $('session').textContent=c.session||'—';
- $('sessionText').textContent=c.sessionActive
-  ? 'Approximate active session'
-  : 'Approximate quiet hours; daylight-saving changes can shift sessions';
+ $('sessionText').textContent=c.sessionActive?'Approximate active session':
+  'Approximate quiet hours; daylight-saving changes can shift sessions';
  $('atr').textContent=c.atr==null?'—':c.atr.toFixed(5);
- $('atrText').textContent=c.atrMean
-  ? (c.atr<c.atrMean*.6?'Low relative volatility — caution':'Volatility not flagged as low')
-  : 'Need more candles for ATR comparison';
-
- drawChart(candles.slice(-100));
- backtest(candles);
-
- const signalCandle=signalCandles[signalCandles.length-1];
- if (signalCandle && c.signal!=='WAIT') {
-  const key=signalCandle.epoch+':'+c.signal+':'+$('timeframe').value;
-  if (lastLogged!==key) {
+ $('atrText').textContent=c.atrMean?
+  (c.atr<c.atrMean*.6?'Low relative volatility — caution':'Volatility not flagged as low'):
+  'Need more candles for ATR comparison';
+ drawChart(candles.slice(-100));backtest(candles);
+ const sc=signalCandles[signalCandles.length-1];
+ if(sc&&c.signal!=='WAIT'){
+  const key=sc.epoch+':'+c.signal+':'+$('timeframe').value;
+  if(lastLogged!==key){
    lastLogged=key;
-   historyRows.unshift({
-    epoch:signalCandle.epoch,
-    signal:c.signal,
-    tf:$('timeframe').value,
-    price:signalCandle.close,
-    reason:c.reason
-   });
+   historyRows.unshift({epoch:sc.epoch,signal:c.signal,tf:$('timeframe').value,price:sc.close,reason:c.reason});
    historyRows=historyRows.slice(0,20);
    $('history').innerHTML=historyRows.map(r=>
-    '<tr><td>'+sriLankaTime(r.epoch)+'</td>'+
-    '<td class="'+(r.signal==='BUY'?'buy':'sell')+'">'+r.signal+'</td>'+
-    '<td>'+r.tf+'</td><td>'+fmt(r.price)+'</td><td>'+r.reason+'</td></tr>'
-   ).join('');
+    '<tr><td>'+sriLankaTime(r.epoch)+'</td><td class="'+
+    (r.signal==='BUY'?'buy':'sell')+'">'+r.signal+'</td><td>'+r.tf+
+    '</td><td>'+fmt(r.price)+'</td><td>'+r.reason+'</td></tr>').join('');
   }
  }
 }
 
-function backtest(data) {
- let wins=0,losses=0,trades=0;
- const expiry=Number($('expiry').value)||1;
- const timeframe=$('timeframe').value;
- const unitMinutes=({'1min':1,'5min':5,'15min':15,'30min':30,'1h':60})[timeframe]||1;
- const bars=Math.max(1,Math.ceil(expiry/unitMinutes));
-
- for (let i=50;i<data.length-bars;i++) {
-  const prefix=data.slice(0,i+1);
-  const state=calcSignal(prefix);
-  if (state.signal!=='BUY'&&state.signal!=='SELL') continue;
-
-  const entry=Number(data[i].close);
-  const exit=Number(data[i+bars].close);
-  if (!Number.isFinite(entry)||!Number.isFinite(exit)||entry===exit) continue;
-
-  trades++;
-  if ((state.signal==='BUY'&&exit>entry)||(state.signal==='SELL'&&exit<entry)) wins++;
-  else losses++;
+function requestCandles(){
+ if(!ws||ws.readyState!==WebSocket.OPEN||busy)return;
+ busy=true;
+ const req=++requestCounter;activeHistoryReq=req;
+ try{
+  sendRequest({
+   ticks_history:SYMBOL,adjust_start_time:1,count:CANDLE_COUNT,
+   end:'latest',style:'candles',
+   granularity:TIMEFRAME_SECONDS[$('timeframe').value]||60,
+   req_id:req
+  });
+ }catch(error){
+  busy=false;activeHistoryReq=null;showError(error.message);
  }
-
- const rate=trades?100*wins/trades:0;
- $('btTrades').textContent=String(trades);
- $('btWL').textContent=wins+' / '+losses;
- $('btRate').textContent=trades?rate.toFixed(1)+'%':'—';
- $('btNote').textContent=
-  'Historical close-to-close estimate using '+bars+
-  ' candle(s) as the expiry approximation. Excludes spread, slippage, payout rules and execution delays. Not a forecast.';
 }
 
-function handleSocketMessage(event, generation) {
- if (generation!==connectionGeneration) return;
-
+function handleSocketMessage(event,generation){
+ if(generation!==connectionGeneration)return;
  let msg;
- try { msg=JSON.parse(event.data); }
- catch (error) { return; }
-
- if (msg.error) {
-  const errorText=msg.error.message||msg.error.code||'Unknown Deriv API error';
-  showError(errorText);
-  busy=false;
-  setConnectButton(false,'Connect market data');
-  return;
+ try{msg=JSON.parse(event.data)}catch(error){return}
+ if(msg.error){
+  busy=false;activeHistoryReq=null;
+  showError((msg.error.code?msg.error.code+': ':'')+(msg.error.message||'Unknown Deriv API error'));
+  setConnectButton(false,'Connect market data');return;
  }
-
- if (msg.msg_type==='tick' && msg.tick) {
-  const quote=Number(msg.tick.quote);
-  const epoch=Number(msg.tick.epoch);
-
-  if (Number.isFinite(quote)) {
-   liveTick=quote;
+ if(msg.msg_type==='tick'&&msg.tick){
+  if(msg.subscription&&msg.subscription.id)tickSubscriptionId=msg.subscription.id;
+  const quote=Number(msg.tick.quote),epoch=Number(msg.tick.epoch);
+  if(Number.isFinite(quote)){
    $('livePrice').textContent=fmt(quote);
    $('liveTime').textContent='Deriv tick · Sri Lanka '+sriLankaTime(epoch);
   }
  }
-
- if (msg.msg_type==='history' && msg.candles) {
-  if (activeHistoryReq!==null && msg.req_id!==activeHistoryReq) return;
-
+ /* Candle responses use msg_type "candles"; accept "history" too for compatibility. */
+ if((msg.msg_type==='candles'||msg.msg_type==='history')&&Array.isArray(msg.candles)){
+  if(activeHistoryReq!==null&&msg.req_id!==undefined&&msg.req_id!==activeHistoryReq)return;
   const received=msg.candles.map(c=>({
-   epoch:Number(c.epoch),
-   datetime:new Date(Number(c.epoch)*1000).toISOString().slice(0,19).replace('T',' '),
-   open:Number(c.open),
-   high:Number(c.high),
-   low:Number(c.low),
-   close:Number(c.close)
-  })).filter(c=>
-   Number.isFinite(c.epoch)&&
-   [c.open,c.high,c.low,c.close].every(Number.isFinite)
-  );
-
+   epoch:Number(c.epoch),open:Number(c.open),high:Number(c.high),
+   low:Number(c.low),close:Number(c.close)
+  })).filter(c=>Number.isFinite(c.epoch)&&[c.open,c.high,c.low,c.close].every(Number.isFinite));
   received.sort((a,b)=>a.epoch-b.epoch);
-
-  // Deduplicate by candle timestamp and always sort chronologically.
   const byEpoch=new Map(candles.map(c=>[c.epoch,c]));
-  for (const candle of received) byEpoch.set(candle.epoch,candle);
-  candles=Array.from(byEpoch.values())
-   .sort((a,b)=>a.epoch-b.epoch)
-   .slice(-CANDLE_COUNT);
-
-  lastFetch=Date.now();
-  busy=false;
-  activeHistoryReq=null;
+  for(const candle of received)byEpoch.set(candle.epoch,candle);
+  candles=Array.from(byEpoch.values()).sort((a,b)=>a.epoch-b.epoch).slice(-CANDLE_COUNT);
+  lastFetch=Date.now();busy=false;activeHistoryReq=null;
   setConnectButton(false,'Connect market data');
   render();
   setStatus('Connected · EUR/USD · last candle refresh '+new Date(lastFetch).toLocaleTimeString()+' · live ticks active.');
  }
-}
-
-function disconnectCurrentSocket() {
- if (ws) {
-  const old=ws;
-  ws=null;
-  try {
-   old.onopen=null;
-   old.onmessage=null;
-   old.onerror=null;
-   old.onclose=null;
-   old.close();
-  } catch (error) {}
+ /* A server may respond with an unexpected history format. Do not leave busy stuck. */
+ if((msg.msg_type==='history'||msg.msg_type==='candles')&&!Array.isArray(msg.candles)){
+  busy=false;activeHistoryReq=null;
+  showError('Unexpected candle-history response format.');
+  setConnectButton(false,'Connect market data');
  }
 }
 
-function connectDeriv() {
- manuallyDisconnected=false;
- if (reconnectTimer) {
-  clearTimeout(reconnectTimer);
-  reconnectTimer=null;
+function disconnectSocket(){
+ if(ws){
+  const old=ws;ws=null;
+  try{
+   old.onopen=null;old.onmessage=null;old.onerror=null;old.onclose=null;old.close();
+  }catch(error){}
  }
+}
 
+function connectDeriv(){
  connectionGeneration++;
  const generation=connectionGeneration;
-
- disconnectCurrentSocket();
- busy=false;
- activeHistoryReq=null;
- candles=[];
- lastFetch=0;
- liveTick=NaN;
- $('livePrice').textContent='—';
- $('liveTime').textContent='Waiting for Deriv tick';
- $('price').textContent='—';
- $('candleTime').textContent='Waiting for data';
- $('signal').textContent='WAIT';
- $('signal').className='signal wait';
+ disconnectSocket();
+ busy=false;activeHistoryReq=null;tickSubscriptionId=null;
+ candles=[];lastFetch=0;lastLogged='';
+ $('livePrice').textContent='—';$('liveTime').textContent='Waiting for Deriv tick';
+ $('price').textContent='—';$('candleTime').textContent='Waiting for data';
+ $('signal').textContent='WAIT';$('signal').className='signal wait';
  $('signalReason').textContent='Waiting for completed candles';
  setConnectButton(true,'Connecting…');
  setStatus('Connecting to Deriv public market data…');
-
  let socket;
- try {
-  socket=new WebSocket(WS_URL);
- } catch (error) {
+ try{socket=new WebSocket(WS_URL)}
+ catch(error){
   showError('Could not create WebSocket: '+error.message);
-  setConnectButton(false,'Connect market data');
-  return;
+  setConnectButton(false,'Connect market data');return;
  }
  ws=socket;
-
  socket.onopen=()=>{
-  if (generation!==connectionGeneration) return;
-  setStatus('Connected to WebSocket · requesting EUR/USD candle history and live ticks…');
-
-  try {
-   sendRequest({
-    ticks_history:SYMBOL,
-    adjust_start_time:1,
-    count:CANDLE_COUNT,
-    end:'latest',
-    style:'candles',
-    granularity:TIMEFRAME_SECONDS[$('timeframe').value]||60,
-    req_id:++requestCounter
-   });
-   activeHistoryReq=requestCounter;
-
-   sendRequest({
-    ticks:SYMBOL,
-    subscribe:1,
-    req_id:++requestCounter
-   });
-  } catch (error) {
-   showError(error.message);
-   setConnectButton(false,'Connect market data');
+  if(generation!==connectionGeneration)return;
+  setStatus('WebSocket connected · requesting EUR/USD candles and live ticks…');
+  try{
+   requestCandles();
+   sendRequest({ticks:SYMBOL,subscribe:1,req_id:++requestCounter});
+  }catch(error){
+   showError(error.message);setConnectButton(false,'Connect market data');
   }
  };
-
  socket.onmessage=event=>handleSocketMessage(event,generation);
-
  socket.onerror=()=>{
-  if (generation!==connectionGeneration) return;
-  showError('WebSocket error. Check internet access and Deriv service availability.');
+  if(generation===connectionGeneration)showError('WebSocket error. Check internet access and Deriv service availability.');
  };
-
  socket.onclose=event=>{
-  if (generation!==connectionGeneration) return;
-
-  busy=false;
-  activeHistoryReq=null;
-  setConnectButton(false,'Connect market data');
-
-  const reason=event.reason ? ' · '+event.reason : '';
-  setStatus(
-   'Deriv connection closed · code '+event.code+reason+
+  if(generation!==connectionGeneration)return;
+  busy=false;activeHistoryReq=null;setConnectButton(false,'Connect market data');
+  setStatus('Deriv connection closed · code '+event.code+
+   (event.reason?' · '+event.reason:'')+
    (event.wasClean?' · clean close':' · unexpected close')+
-   '. Press Connect to reconnect.'
-  );
+   '. Press Connect to reconnect.');
  };
 }
 
-function requestCandles() {
- if (!ws || ws.readyState!==WebSocket.OPEN || busy) return;
-
- busy=true;
- const req=++requestCounter;
- activeHistoryReq=req;
-
- try {
-  sendRequest({
-   ticks_history:SYMBOL,
-   adjust_start_time:1,
-   count:CANDLE_COUNT,
-   end:'latest',
-   style:'candles',
-   granularity:TIMEFRAME_SECONDS[$('timeframe').value]||60,
-   req_id:req
-  });
- } catch (error) {
-  busy=false;
-  activeHistoryReq=null;
-  showError(error.message);
- }
-}
-
-function fetchData() {
- if (!ws || ws.readyState!==WebSocket.OPEN) return;
- if (busy) return;
- if (Date.now()-lastFetch<POLL_MS) return;
+function fetchData(){
+ if(!ws||ws.readyState!==WebSocket.OPEN||busy)return;
+ if(Date.now()-lastFetch<POLL_MS)return;
  requestCandles();
 }
 
 $('start').addEventListener('click',connectDeriv);
-
 $('timeframe').addEventListener('change',()=>{
- lastFetch=0;
- candles=[];
- busy=false;
- if (ws && ws.readyState===WebSocket.OPEN) {
+ lastFetch=0;candles=[];busy=false;activeHistoryReq=null;
+ if(ws&&ws.readyState===WebSocket.OPEN){
   requestCandles();
- } else {
+ }else{
   setStatus('Timeframe changed. Press Connect market data to load candles.');
  }
 });
-
-$('expiry').addEventListener('change',()=>{
- if (candles.length) backtest(candles);
-});
-
-if (pollTimer) clearInterval(pollTimer);
-pollTimer=setInterval(()=>{
- fetchData();
-},5000);
-
+$('expiry').addEventListener('change',()=>{if(candles.length)backtest(candles)});
+if(pollTimer)clearInterval(pollTimer);
+pollTimer=setInterval(fetchData,5000);
 window.addEventListener('online',()=>{
- if (!ws || ws.readyState===WebSocket.CLOSED) {
-  setStatus('Internet connection restored. Press Connect market data.');
- }
+ if(!ws||ws.readyState===WebSocket.CLOSED)setStatus('Internet restored. Press Connect market data.');
 });
-
-window.addEventListener('offline',()=>{
- showError('Your device appears to be offline.');
-});
+window.addEventListener('offline',()=>showError('Your device appears to be offline.'));
 </script>
 </body>
 </html>
